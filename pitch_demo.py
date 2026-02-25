@@ -1,214 +1,151 @@
+"""
+Piano Pitch Detector — Pure NumPy YIN (zero extra dependencies)
+Requires only: numpy + sounddevice (already installed)
+"""
+
 import numpy as np
 import sounddevice as sd
 import queue
 import time
 
-# notes with no sharps
-NATURAL_NOTES = {'C', 'D', 'E', 'F', 'G', 'A', 'B'}
+NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+FMIN = 27.5
+FMAX = 4186.0
 
-# all 12 notes in music
-NOTES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
 
-# estimate the fundamental frequency
-def detect_pitch_autocorr(x, fs, fmin=80, fmax=1200):
-    x = x.astype(np.float32)
-    x = x - np.mean(x)
-    x *= np.hanning(len(x)).astype(np.float32)
+def yin_pitch(x, fs, threshold=0.12):
+    """
+    YIN algorithm — pure NumPy, no librosa needed.
+    Dramatically fewer octave errors than plain autocorrelation.
+    Returns frequency in Hz, or 0.0 if no clear pitch detected.
+    """
+    x = x.astype(np.float64)
+    x -= np.mean(x)
 
-    c = np.correlate(x, x, mode='full')[len(x)-1:]
-    min_lag = int(fs / fmax)
-    max_lag = int(fs / fmin)
-    if max_lag <= min_lag + 2:
+    n = len(x)
+    min_lag = max(2, int(fs / FMAX))
+    max_lag = min(n // 2, int(fs / FMIN) + 1)
+
+    if min_lag >= max_lag:
         return 0.0
 
-    region = c[min_lag:max_lag]
-    peak_rel = int(np.argmax(region))
-    peak = peak_rel + min_lag
-    if peak <= 0:
+    # Step 1: Difference function via FFT (fast)
+    # d[tau] = sum((x[t] - x[t+tau])^2) = 2*(energy - autocorr[tau])
+    x_pad = np.zeros(2 * n)
+    x_pad[:n] = x
+    X = np.fft.rfft(x_pad)
+    acf = np.fft.irfft(X * np.conj(X))[:n].real
+    energy = float(np.dot(x, x))
+    df = np.zeros(max_lag)
+    for tau in range(1, max_lag):
+        df[tau] = 2.0 * (energy - acf[tau])
+
+    # Step 2: Cumulative mean normalization (kills octave errors)
+    cmnd = np.ones(max_lag)
+    running_sum = 0.0
+    for tau in range(1, max_lag):
+        running_sum += df[tau]
+        cmnd[tau] = df[tau] * tau / running_sum if running_sum > 0 else 1.0
+
+    # Step 3: Find first dip below threshold
+    tau_est = -1
+    for tau in range(min_lag, max_lag - 1):
+        if cmnd[tau] < threshold:
+            # Find local minimum around this dip
+            while tau + 1 < max_lag - 1 and cmnd[tau + 1] < cmnd[tau]:
+                tau += 1
+            tau_est = tau
+            break
+
+    # If no dip found, take global minimum (less reliable but better than nothing)
+    if tau_est == -1:
+        tau_est = int(np.argmin(cmnd[min_lag:max_lag])) + min_lag
+        if cmnd[tau_est] > 0.35:  # still too noisy — give up
+            return 0.0
+
+    # Step 4: Parabolic interpolation for sub-sample accuracy
+    if 0 < tau_est < max_lag - 1:
+        y0, y1, y2 = cmnd[tau_est - 1], cmnd[tau_est], cmnd[tau_est + 1]
+        denom = 2.0 * (2.0 * y1 - y0 - y2)
+        if abs(denom) > 1e-10:
+            tau_est = tau_est + (y2 - y0) / denom
+
+    if tau_est <= 0:
         return 0.0
-    
-    # turn repeat distance into frequency
-    return float(fs / peak)
 
-# change frequency into a MIDI number
-def freq_to_midi(f):
-    return int(round(12 * np.log2(f / 440.0))) + 69
-
-# turns MIDI number into note letter
-def midi_to_letter(n):
-    return NOTES[n % 12]
-
-# if note has a sharp, move it to nearest normal note
-def snap_to_natural(midi_n):
-    name = midi_to_letter(midi_n)
-    if name in NATURAL_NOTES:
-        return midi_n
-    if midi_to_letter(midi_n - 1) in NATURAL_NOTES:
-        return midi_n - 1
-    if midi_to_letter(midi_n + 1) in NATURAL_NOTES:
-        return midi_n + 1
-    return midi_n
-
-# move pitch up or down so it stays in same octave
-def force_into_range(f, low=150, high=900):
-    if f <= 0:
-        return 0.0
-    while f < low:
-        f *= 2.0
-    while f > high:
-        f /= 2.0
-    return f
-
-# check if detected frequency is close enough to a real note
-def is_confident_pitch(f, midi_n, confidence_cents=50):
-    if f <= 0:
-        return False
-    
-    # expected frequency for the MIDI note
-    expected_freq = 440 * (2 ** ((midi_n - 69) / 12.0))
-    
-    # how many cents off are we?
-    cents_off = 1200 * np.log2(f / expected_freq)
-    
-    return abs(cents_off) <= confidence_cents
+    return fs / tau_est
 
 
-def list_and_pick_device():
-    devices = sd.query_devices()
-    print("\n=== Available Audio Devices ===")
-    for i, dev in enumerate(devices):
-        print(f"{i}: {dev['name']} (in: {dev['max_input_channels']}, out: {dev['max_output_channels']})")
+def freq_to_note(f):
+    midi_n = int(round(12 * np.log2(f / 440.0))) + 69
+    note_name = NOTES[midi_n % 12]
+    octave = (midi_n // 12) - 1
+    return note_name, midi_n
+
+
+def list_input_devices():
+    print("\nAvailable input devices:")
+    for i, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            print(f"  [{i}] {dev['name']}")
     print()
-    
-    try:
-        choice = input("Enter device index (default 0): ").strip()
-        if choice == "":
-            return 0
-        return int(choice)
-    except (ValueError, IndexError):
-        print("Invalid input, using device 0.")
-        return 0
 
 
 def main():
     fs = 44100
-    
-    # Ask user to pick device or use default
-    print("Checking available microphones...")
-    device_index = list_and_pick_device()
 
-    # how much sound we check each time
-    frame_size = 2048 
-    hop_size = 1024 # smaller hop = faster updates
+    list_input_devices()
+    default_device = sd.default.device[0]
 
-    # pitch limits and octave range
-    fmin, fmax = 80, 1200
-    fold_low, fold_high = 150, 900
+    try:
+        raw = input(f"Enter device index (Enter = default [{default_device}]): ").strip()
+        device_index = int(raw) if raw else default_device
+    except ValueError:
+        device_index = default_device
 
-    # ignore super quiet input (tune this based on your mic)
-    rms_floor = 0.0010
-
-    # only print when sound is above average loudness by this ratio
-    # (allows continuous notes, not just onsets)
-    onset_ratio = 1.25          
-    onset_min_delta = 0.0005    
-
-    # wait this long before printing another note (debounce on note *changes*)
-    debounce_sec = 0.25
-
-    # how many times note must repeat before printing (higher = more stable)
-    stable_needed = 2
-
-    # confidence check: how close to a real note (in cents)
-    confidence_cents = 60
+    frame_size = 4096   # ~93ms window
+    hop_size   = 512    # controls responsiveness
+    rms_floor  = 0.004  # silence gate — raise if you get noise detections
 
     q = queue.Queue()
     buf = np.zeros(frame_size, dtype=np.float32)
 
-    rms_avg = 0.0 # average loudness
-    last_print_time = 0.0
-
-    # for pitch stability
-    last_note = None
-    same = 0
-
-    # this runs every time new sound comes in
     def callback(indata, frames, time_info, status):
         q.put(indata[:, 0].copy())
 
-    print(f"\nListening on device {device_index}...")
-    print("Playing notes now. Press Ctrl+C to stop.\n")
+    print(f"\n─── PIANO DETECTOR (YIN/numpy) | device {device_index} ───")
+    print("Play something — notes appear below. Ctrl+C to stop.\n")
+
+    last_midi = None
 
     try:
-        with sd.InputStream(
-            samplerate=fs,
-            channels=1,
-            dtype='float32',
-            device=device_index,
-            blocksize=hop_size,
-            callback=callback
-        ):
+        with sd.InputStream(samplerate=fs, channels=1, device=device_index,
+                            blocksize=hop_size, callback=callback):
             while True:
-                x = q.get()
-
-                # slide old sound out, add new sound in
+                chunk = q.get()
                 buf[:-hop_size] = buf[hop_size:]
-                buf[-hop_size:] = x
+                buf[-hop_size:] = chunk
 
-                # how loud is it?
-                rms = float(np.sqrt(np.mean(buf**2)))
-                
-                # update average loudness with exponential moving average
-                if rms_avg == 0:
-                    rms_avg = rms
-                else:
-                    rms_avg = 0.95 * rms_avg + 0.05 * rms
-
-                # skip if below floor
+                rms = float(np.sqrt(np.mean(buf ** 2)))
                 if rms < rms_floor:
+                    if last_midi is not None:
+                        print()
+                        last_midi = None
                     continue
 
-                # did it get louder than the rolling average?
-                is_onset = rms > rms_avg * onset_ratio
+                freq = yin_pitch(buf, fs)
 
-                if not is_onset:
+                if freq <= FMIN * 1.05 or freq >= FMAX * 0.95:
                     continue
 
-                now = time.time()
-                
-                # only allow a new print every debounce_sec — regardless of note
-                if now - last_print_time < debounce_sec:
-                    continue
+                note_label, midi_n = freq_to_note(freq)
 
-                # find the pitch
-                f = detect_pitch_autocorr(buf, fs, fmin=fmin, fmax=fmax)
-                if f <= 0:
-                    continue
-
-                f = force_into_range(f, low=fold_low, high=fold_high)
-                midi_n = freq_to_midi(f)
-                midi_n = snap_to_natural(midi_n)
-                note = midi_to_letter(midi_n)
-
-                # confidence check: is it really that note?
-                if not is_confident_pitch(f, midi_n, confidence_cents=confidence_cents):
-                    continue
-
-                # make sure note stays same for a moment
-                if note == last_note:
-                    same += 1
-                else:
-                    last_note = note
-                    same = 1
-
-                if same < stable_needed:
-                    continue
-
-                print(note)
-                last_print_time = now
+                if midi_n != last_midi:
+                    print(note_label, end=" ", flush=True)
+                    last_midi = midi_n
 
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\n\nStopped.")
 
 
 if __name__ == "__main__":
