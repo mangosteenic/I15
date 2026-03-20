@@ -1,6 +1,6 @@
 """
 AI-Harmonized Robotic Band (Team I15)
-Pitch Harmonizer & Servo Controller with Strict Noise Gating
+6-Servo "Twinkle Twinkle" Unison Demo with Octave Isolation
 """
 
 import numpy as np
@@ -9,7 +9,7 @@ import queue
 import time
 from collections import deque
 
-# --- HARDWARE IMPORTS (Raspberry Pi & Mac Fallback) ---
+# --- HARDWARE IMPORTS ---
 try:
     import board
     import busio
@@ -22,45 +22,33 @@ except (ImportError, NotImplementedError):
     HARDWARE_ENABLED = False
 
 NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-FMIN = 27.5
-FMAX = 4186.0
 
 # ==========================================
-# --- TUNING & CALIBRATION VARIABLES ---
-# ==========================================
+# --- THE "BLINDERS" FIX (HIGH ACCURACY) ---
+# We only care about C4 (261 Hz) to A4 (440 Hz).
+# Restricting the math eliminates 99% of octave errors and harmonic noise.
+FMIN = 250.0
+FMAX = 500.0
 
-# Set to True to print volume levels. Play your instrument, note the number,
-# then stop playing and note the background noise number. Set VOLUME_THRESHOLD in between.
 CALIBRATE_VOLUME = False
-
-# The minimum volume required to trigger pitch detection.
-# 0.005 is a quiet room. 0.05 requires loud/close sound.
-VOLUME_THRESHOLD = 0.025
-
+VOLUME_THRESHOLD = 0.03
 # ==========================================
 
-# --- SERVO & HARMONY CONFIGURATION ---
-# SERVO_MAP: Which physical PCA9685 channel controls which piano key
+# --- 6-SERVO HARDWARE MAP ---
+# Map MIDI notes to the 6 physical PCA9685 channels (0 through 5)
 SERVO_MAP = {
-    60: (0, 45, 0),  # C4 is on Channel 0
-    62: (1, 45, 0),  # D4 is on Channel 1
-    64: (2, 45, 0),  # E4 is on Channel 2
-    65: (3, 45, 0),  # F4 is on Channel 3
-    67: (4, 45, 0),  # G4 is on Channel 4
-}
-
-# HARMONY_MAP: What the robot plays when it hears you play a specific note
-HARMONY_MAP = {
-    60: 64,  # If it hears C4 (60), the robot plays E4 (64)
-    62: 65,  # If it hears D4 (62), the robot plays F4 (65)
-    64: 67,  # If it hears E4 (64), the robot plays G4 (67)
-    # Add more harmony rules here!
+    60: (0, 45, 0),  # C4 -> Channel 0
+    62: (1, 45, 0),  # D4 -> Channel 1
+    64: (2, 45, 0),  # E4 -> Channel 2
+    65: (3, 45, 0),  # F4 -> Channel 3
+    67: (4, 45, 0),  # G4 -> Channel 4
+    69: (5, 45, 0),  # A4 -> Channel 5
 }
 
 
 # --- YIN ALGORITHM ---
 def yin_pitch(x, fs, threshold=0.15):
-    """Pure NumPy YIN algorithm."""
+    """Pure NumPy YIN algorithm, restricted to our target octave."""
     x = x.astype(np.float64)
     x -= np.mean(x)
     n = len(x)
@@ -136,7 +124,7 @@ class ServoController:
             if HARDWARE_ENABLED:
                 self.servos[midi_n].angle = active_angle
             self.active_note = midi_n
-            print(f"   [ROBOT] Playing Harmony Note {midi_n} on Servo CH{channel}")
+            print(f"   [ROBOT] Striking Note {midi_n} on Servo CH{channel}")
 
     def release_all(self):
         if self.active_note is not None and self.active_note in SERVO_MAP:
@@ -158,7 +146,7 @@ def main():
     def callback(indata, frames, time_info, status):
         q.put(indata[:, 0].copy())
 
-    print("\n─── PIANO HARMONIZER & SERVO CONTROLLER ───")
+    print("\n─── 6-SERVO TWINKLE TWINKLE DEMO ───")
     if CALIBRATE_VOLUME:
         print(">>> CALIBRATION MODE ON: Printing raw volume levels...")
 
@@ -177,7 +165,7 @@ def main():
 
                 if CALIBRATE_VOLUME:
                     print(f"Current Vol: {rms:.4f} | Threshold: {VOLUME_THRESHOLD}")
-                    time.sleep(0.1)  # Slow it down so you can read it
+                    time.sleep(0.1)
                     continue
 
                 if rms < VOLUME_THRESHOLD:
@@ -189,7 +177,8 @@ def main():
 
                 freq = yin_pitch(buf, fs)
 
-                if freq <= FMIN * 1.05 or freq >= FMAX * 0.95:
+                # Skip if YIN completely failed or returned 0
+                if freq == 0.0:
                     continue
 
                 note_label, heard_midi = freq_to_note(freq)
@@ -199,12 +188,11 @@ def main():
                     stable_midi = note_history[0]
 
                     if stable_midi != last_printed_note:
-                        print(f"[MIC] Heard: {note_label} (MIDI: {stable_midi})")
+                        print(f"[MIC] Confirmed: {note_label} (MIDI: {stable_midi})")
 
-                        # Check if we have a harmony programmed for this note
-                        if stable_midi in HARMONY_MAP:
-                            harmony_midi = HARMONY_MAP[stable_midi]
-                            controller.play_note(harmony_midi)
+                        # 1:1 Mapping: Play the exact note it just heard
+                        if stable_midi in SERVO_MAP:
+                            controller.play_note(stable_midi)
 
                         last_printed_note = stable_midi
 
